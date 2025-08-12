@@ -1,11 +1,12 @@
 const imaps = require("imap-simple");
 const dotenv = require("dotenv");
 const { createClient } = require("@supabase/supabase-js");
+const { simpleParser } = require("mailparser");
 
 dotenv.config({ path: "./config.env" });
 
 const linkedinApplicationText = "Mahesh, your application was sent to";
-const linkedinEmail = "LinkedIn <jobs-noreply@linkedin.com>";
+const linkedinEmail = `"LinkedIn" <jobs-noreply@linkedin.com>`;
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -54,10 +55,13 @@ async function fetchEmails() {
     yesterday = yesterday.toISOString();
 
     // Below two variables are required by 'IMAP'.
-    const searchCriteria = [["SINCE", yesterday]];
+    const searchCriteria = ["UNSEEN", ["SINCE", yesterday]];
 
     const fetchOptions = {
-      bodies: ["HEADER", "TEXT"],
+      // getting full raw email
+      bodies: [""],
+      // This is one way to mark a message as read, other is using 'uid' and adding flags as displayed below. This will mark the message as read when fetching so not a good option if we want to add some conditions.
+      // markSeen: true,
       markSeen: false,
     };
 
@@ -66,32 +70,54 @@ async function fetchEmails() {
 
     // We get all the emails in the past 24 hours but we only want one which meet our use case, which is to get emails regarding job applied on linkedin.
     for (const res of results) {
-      for (const email of res.parts) {
-        // Each email is basically divided in two parts, one is the title('HEADER') and another is subject ('TEXT').
-        // We check the header for some certain text and sender email which will make sure that the given email was sent by linkedin only.
-        if (email.which === "HEADER") {
-          const subjectArr = email.body.subject[0].split(" ");
-          const tomatch = subjectArr.slice(0, 6).join(" ");
+      // This 'uid' is later used to mark the email as read.
+      const uid = res.attributes.uid;
+      const all = res.parts.find((part) => part.which === ""); // raw message
+      if (!all) continue;
 
-          if (
-            tomatch === linkedinApplicationText &&
-            email.body.from[0] === linkedinEmail
-          ) {
-            const companyName = subjectArr[6];
-            const date = formatDate(email.body.date[0]);
+      // Parsing using mailparser
+      const parsed = await simpleParser(all.body);
 
-            const newApplication = {
-              company: companyName,
-              platform: "Linkedin",
-              url: "",
-              status: "pending",
-              date_applied: date,
-            };
+      // LinkedIn check
+      if (
+        parsed.subject.startsWith(linkedinApplicationText) &&
+        parsed.from?.text === linkedinEmail
+      ) {
+        // Finding link for the Position
 
-            // Creating new application on supabase.
-            await createNewApplication(newApplication);
+        // Splitting by new line.
+        const text = parsed.text.split(/\r?\n/);
+
+        let url = "";
+        for (const currEl of text) {
+          if (currEl.startsWith("View job:")) {
+            url = currEl.split(" ")[2];
+            break;
           }
         }
+
+        const subjectArr = parsed.subject.split(" ");
+        for (let i = 0; i <= 5; i++) {
+          subjectArr.shift();
+        }
+
+        const companyName = subjectArr.join(" ");
+        const date = formatDate(parsed.date);
+
+        const newApplication = {
+          company: companyName,
+          platform: "Linkedin",
+          url: url,
+          status: "pending",
+          date_applied: date,
+        };
+
+        // Creating application
+        await createNewApplication(newApplication);
+        console.log("New application created succesfully!");
+        // Marking the mail as seen if it is not already seen
+        await connection.addFlags(uid, ["\\Seen"]);
+        console.log("Email marked as read!");
       }
     }
 
@@ -102,3 +128,29 @@ async function fetchEmails() {
 }
 
 fetchEmails();
+
+// To kill the process in certain time.
+/*
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`Timeout after ${ms / 1000} seconds`)),
+        ms
+      )
+    ),
+  ]);
+}
+
+(async () => {
+  try {
+    // 10 minutes = 600,000 ms
+    await withTimeout(fetchEmails(), 10 * 60 * 1000);
+    console.log("Process completed before timeout");
+  } catch (err) {
+    console.error("Process timed out or failed:", err.message);
+    process.exit(1); // exit immediately if it timed out
+  }
+})();
+*/
